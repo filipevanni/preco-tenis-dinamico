@@ -1,3 +1,4 @@
+# app.py
 import os
 import csv
 import io
@@ -5,17 +6,22 @@ from typing import Dict, Tuple, List
 from flask import Flask, request, jsonify
 import requests
 import unidecode
+import math
 
 app = Flask(__name__)
 
-# --------- Config ---------
+# =========================
+# Config
+# =========================
 CSV_URL = os.getenv("FONTE_MATERIAIS_CSV_URL")  # planilha publicada como CSV (materiais,preco)
-TIMEOUT = 15  # segundos para baixar o CSV
+TIMEOUT = 20  # segundos para baixar o CSV
 
-# --------- Normalização única (planilha e entrada usam a mesma regra) ---------
+# =========================
+# Normalização única (planilha e entrada)
+# =========================
 def norm(txt: str) -> str:
     """
-    Normaliza qualquer texto para comparação:
+    Normaliza para comparação:
     - minúsculas
     - remove acentos
     - troca hífen por espaço
@@ -26,8 +32,41 @@ def norm(txt: str) -> str:
     t = " ".join(t.split())
     return t
 
-# --------- Cache em memória ---------
-# chave normalizada -> (nome_canonico, preco_int)
+# =========================
+# Arredondamento: inteiro mais próximo que termina em 7
+# Tie-break (empate) sempre para cima
+# =========================
+def arredonda_para_terminar_em_7(valor: float) -> int:
+    """
+    Retorna o inteiro mais próximo que termina em 7.
+    Em caso de empate, escolhe o MAIOR (para cima).
+    Ex.: 2764  -> 2767
+         2768  -> 2767
+         15.2  -> 17
+         12.0 (entre 7 e 17, mais perto de 12) -> 7 (mas se ficar exatamente no meio, vai para 17)
+    """
+    # base7 inferior
+    lower7 = (math.floor(valor) // 10) * 10 + 7
+    # Se o lower7 ficou acima do valor mas ainda há um 7 anterior na dezena anterior:
+    if lower7 > valor:
+        lower7 -= 10
+    upper7 = lower7 + 10
+
+    dist_lower = abs(valor - lower7)
+    dist_upper = abs(upper7 - valor)
+
+    if dist_lower < dist_upper:
+        return int(lower7)
+    elif dist_upper < dist_lower:
+        return int(upper7)
+    else:
+        # empate -> para cima
+        return int(upper7)
+
+# =========================
+# Cache em memória
+# chave normalizada -> (nome_canonico, preco_int_unitario)
+# =========================
 PRECOS: Dict[str, Tuple[str, int]] = {}
 
 def carregar_precos_do_csv() -> None:
@@ -44,28 +83,37 @@ def carregar_precos_do_csv() -> None:
 
     precos_tmp: Dict[str, Tuple[str, int]] = {}
     for row in reader:
-        nome = (row.get("materiais") or "").strip()
-        preco_raw = (row.get("preco") or "").strip()
-
+        nome = (row.get("materiais") or row.get("material") or "").strip()
+        preco_raw = (row.get("preco") or row.get("preço") or "").strip()
         if not nome or not preco_raw:
             continue
 
-        # converte preço para int (remove possíveis separadores)
-        preco_num = int(str(preco_raw).replace(".", "").replace(",", "").strip())
+        # converte preço para int tolerando "1.497", "1497,00", "R$ 1497"
+        s = preco_raw.replace("R$", "").replace(".", "").replace(" ", "").replace(",", ".")
+        try:
+            preco_num = int(round(float(s)))
+        except Exception:
+            # fallback apenas dígitos
+            digs = "".join(ch for ch in preco_raw if ch.isdigit())
+            if not digs:
+                continue
+            preco_num = int(digs)
 
         chave = norm(nome)
+        if not chave:
+            continue
+
         precos_tmp[chave] = (nome, preco_num)
 
     if not precos_tmp:
-        raise RuntimeError("Nenhuma linha válida encontrada no CSV (colunas esperadas: 'materiais', 'preco').")
+        raise RuntimeError("Nenhuma linha válida encontrada no CSV (colunas esperadas: 'materiais' e 'preco').")
 
     PRECOS = precos_tmp
 
-# carrega na inicialização
+# carrega na inicialização (sem matar o processo se falhar)
 try:
     carregar_precos_do_csv()
 except Exception as e:
-    # Se falhar na subida, a primeira chamada tenta recarregar também
     print(f"[AVISO] Não foi possível carregar os preços ao iniciar: {e}")
 
 def garantir_precos() -> None:
@@ -73,33 +121,71 @@ def garantir_precos() -> None:
     if not PRECOS:
         carregar_precos_do_csv()
 
-# --------- Regras de precificação ---------
+# =========================
+# Regras de precificação
+# =========================
 def preco_media_simples(precos: List[int]) -> int:
-    return round(sum(precos) / max(len(precos), 1))
+    bruto = sum(precos) / max(len(precos), 1)
+    return arredonda_para_terminar_em_7(bruto)
 
 REGRAS = {
     "media_simples": preco_media_simples,
-    # se quiser, adicione outras regras aqui depois (ex.: soma, margem, etc.)
+    # aqui dá pra adicionar outras regras no futuro
 }
 
-# --------- Endpoint ---------
-@app.route("/preco", methods=["GET"])
+# =========================
+# Endpoints
+# =========================
+@app.route("/")
+def alive():
+    try:
+        garantir_precos()
+        disponiveis = sorted({canon for (canon, _) in PRECOS.values()})
+    except Exception as e:
+        return jsonify({"ok": False, "erro": str(e)})
+    return jsonify({"ok": True, "materiais_disponiveis": disponiveis})
+
+@app.route("/materiais")
+def materiais():
+    try:
+        garantir_precos()
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+    itens = [
+        {"material": PRECOS[k][0], "preco": PRECOS[k][1]}
+        for k in sorted(PRECOS.keys())
+    ]
+    return jsonify({"materiais": itens, "fonte_csv": CSV_URL})
+
+@app.route("/reload", methods=["POST"])
+def reload():
+    try:
+        carregar_precos_do_csv()
+        return jsonify({"ok": True, "materiais_catalogo": len(PRECOS)})
+    except Exception as e:
+        return jsonify({"ok": False, "erro": str(e)}), 500
+
+@app.route("/preco")
 def preco():
     """
     /preco?materiais=Couro%20Bovino,Couro%20de%20Til%C3%A1pia,Jeans&regra=media_simples
+    - aceita qualquer ordem, acentos/caixa/hífen (normaliza tudo)
+    - arredonda para inteiro mais próximo que termina em 7 (tie-break para cima)
     """
-    garantir_precos()
+    try:
+        garantir_precos()
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
 
     materias_qs = request.args.get("materiais", "").strip()
-    regra = request.args.get("regra", "media_simples").strip() or "media_simples"
+    regra = (request.args.get("regra", "media_simples") or "media_simples").strip()
 
     if not materias_qs:
         return jsonify({"erro": "Parâmetro 'materiais' é obrigatório."}), 400
-
     if regra not in REGRAS:
         return jsonify({"erro": f"Regra inválida. Use uma destas: {list(REGRAS.keys())}"}), 400
 
-    # divide por vírgula
     pedidos = [m.strip() for m in materias_qs.split(",") if m.strip()]
     if not pedidos:
         return jsonify({"erro": "Nenhum material informado."}), 400
@@ -118,8 +204,7 @@ def preco():
             nao_encontrados.append(m)
 
     if nao_encontrados:
-        # sugiro opções válidas (os nomes canônicos do CSV)
-        sugestoes = sorted(list({canon for (canon, _) in PRECOS.values()}))
+        sugestoes = sorted({canon for (canon, _) in PRECOS.values()})
         return jsonify({
             "erro": "Materiais desconhecidos.",
             "nao_encontrados": nao_encontrados,
@@ -131,14 +216,9 @@ def preco():
     return jsonify({
         "materiais": [item["material"] for item in itens_precificados],
         "itens_precificados": itens_precificados,
-        "preco": preco_final,
+        "preco": int(preco_final),
         "regra": regra
     })
 
-@app.route("/")
-def alive():
-    return jsonify({"ok": True, "materiais_disponiveis": sorted(list({canon for (canon, _) in PRECOS.values()}))})
-
 if __name__ == "__main__":
-    # Para rodar local: python app.py
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))

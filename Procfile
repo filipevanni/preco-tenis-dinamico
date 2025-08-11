@@ -1,2 +1,1 @@
-app.py
-requirements.txt
+web: gunicorn app:app

@@ -1,216 +1,144 @@
-# app.py
-from __future__ import annotations
+import os
 import csv
 import io
-import os
-import time
 from typing import Dict, Tuple, List
-
-import requests
 from flask import Flask, request, jsonify
+import requests
 import unidecode
 
 app = Flask(__name__)
 
-# =========================
-# Config via ambiente
-# =========================
-# Link público do Google Sheets (export CSV) contendo as colunas:
-#   material, preco
-# ou  materiais, preco
-MATERIAIS_URL = os.getenv("MATERIAIS_URL", "").strip()
+# --------- Config ---------
+CSV_URL = os.getenv("FONTE_MATERIAIS_CSV_URL")  # planilha publicada como CSV (materiais,preco)
+TIMEOUT = 15  # segundos para baixar o CSV
 
-# Cache para evitar baixar a planilha a cada request
-CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # 5 min padrão
-_CACHE_DATA: Dict[str, int] = {}
-_CACHE_RAW_NAMES: Dict[str, str] = {}
-_CACHE_TS: float = 0.0
-
-
-# =========================
-# Normalização de nomes
-# =========================
-def normaliza_nome(txt: str) -> str:
+# --------- Normalização única (planilha e entrada usam a mesma regra) ---------
+def norm(txt: str) -> str:
     """
-    - minúsculo
-    - sem acento
-    - remove ' de ' isolado
+    Normaliza qualquer texto para comparação:
+    - minúsculas
+    - remove acentos
     - troca hífen por espaço
-    - compacta espaços
+    - colapsa espaços
     """
-    t = unidecode.unidecode(txt.strip().lower())
-    t = t.replace(" de ", " ")
+    t = unidecode.unidecode((txt or "").strip().lower())
     t = t.replace("-", " ")
     t = " ".join(t.split())
     return t
 
+# --------- Cache em memória ---------
+# chave normalizada -> (nome_canonico, preco_int)
+PRECOS: Dict[str, Tuple[str, int]] = {}
 
-# =========================
-# Carregar / cachear planilha
-# =========================
-def _baixar_planilha(url: str) -> Tuple[Dict[str, int], Dict[str, str]]:
-    """
-    Baixa CSV e devolve:
-      - dict normalizado->preco_int
-      - dict normalizado->nome_original (para mensagens)
-    """
-    if not url:
-        raise RuntimeError("MATERIAIS_URL não configurada nas variáveis de ambiente.")
+def carregar_precos_do_csv() -> None:
+    """Baixa o CSV publicado e povoa o dicionário PRECOS normalizado."""
+    global PRECOS
+    if not CSV_URL:
+        raise RuntimeError("Variável de ambiente FONTE_MATERIAIS_CSV_URL não configurada.")
 
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
+    resp = requests.get(CSV_URL, timeout=TIMEOUT)
+    resp.raise_for_status()
 
-    data_norm_to_price: Dict[str, int] = {}
-    data_norm_to_raw: Dict[str, str] = {}
+    content = resp.content.decode("utf-8", errors="ignore")
+    reader = csv.DictReader(io.StringIO(content))
 
-    f = io.StringIO(r.text)
-    reader = csv.DictReader(f)
-
-    # aceita cabeçalhos: "material" ou "materiais" (singular/plural) e "preco"
-    possible_name_cols = ["material", "materiais", "nome", "nome_material"]
-    name_col = None
-    for c in reader.fieldnames or []:
-        c2 = c.strip().lower()
-        if c2 in possible_name_cols:
-            name_col = c
-    if not name_col:
-        raise RuntimeError(
-            "Cabeçalho não encontrado. Esperado colunas 'material' (ou 'materiais') e 'preco'."
-        )
-
-    # acha coluna de preço
-    price_col = None
-    for c in reader.fieldnames or []:
-        if c.strip().lower() in ("preco", "preço", "price"):
-            price_col = c
-    if not price_col:
-        raise RuntimeError("Coluna de preço não encontrada (ex.: 'preco').")
-
+    precos_tmp: Dict[str, Tuple[str, int]] = {}
     for row in reader:
-        raw_name = (row.get(name_col) or "").strip()
-        raw_price = (row.get(price_col) or "").strip()
-        if not raw_name:
-            continue
-        try:
-            # aceita 1497 ou 1497,00 ou 1.497 etc.
-            p = (
-                raw_price.replace(".", "")
-                .replace("R$", "")
-                .replace(" ", "")
-                .replace(",", ".")
-            )
-            price_int = int(round(float(p)))
-        except Exception:
+        nome = (row.get("materiais") or "").strip()
+        preco_raw = (row.get("preco") or "").strip()
+
+        if not nome or not preco_raw:
             continue
 
-        norm = normaliza_nome(raw_name)
-        data_norm_to_price[norm] = price_int
-        data_norm_to_raw[norm] = raw_name
+        # converte preço para int (remove possíveis separadores)
+        preco_num = int(str(preco_raw).replace(".", "").replace(",", "").strip())
 
-    if not data_norm_to_price:
-        raise RuntimeError("Nenhum material válido encontrado no CSV.")
+        chave = norm(nome)
+        precos_tmp[chave] = (nome, preco_num)
 
-    return data_norm_to_price, data_norm_to_raw
+    if not precos_tmp:
+        raise RuntimeError("Nenhuma linha válida encontrada no CSV (colunas esperadas: 'materiais', 'preco').")
 
+    PRECOS = precos_tmp
 
-def _garantir_cache() -> None:
-    global _CACHE_DATA, _CACHE_RAW_NAMES, _CACHE_TS
-    now = time.time()
-    if now - _CACHE_TS > CACHE_TTL or not _CACHE_DATA:
-        data, raw = _baixar_planilha(MATERIAIS_URL)
-        _CACHE_DATA = data
-        _CACHE_RAW_NAMES = raw
-        _CACHE_TS = now
+# carrega na inicialização
+try:
+    carregar_precos_do_csv()
+except Exception as e:
+    # Se falhar na subida, a primeira chamada tenta recarregar também
+    print(f"[AVISO] Não foi possível carregar os preços ao iniciar: {e}")
 
+def garantir_precos() -> None:
+    """Recarrega o cache se estiver vazio (ex.: após cold start)."""
+    if not PRECOS:
+        carregar_precos_do_csv()
 
-# =========================
-# Endpoints
-# =========================
-@app.route("/ping")
-def ping():
-    return jsonify({"ok": True, "service": "api-precos-dinamicos"})
+# --------- Regras de precificação ---------
+def preco_media_simples(precos: List[int]) -> int:
+    return round(sum(precos) / max(len(precos), 1))
 
-@app.route("/materiais")
-def materiais():
-    """
-    Lista materiais disponíveis e seus preços base.
-    """
-    try:
-        _garantir_cache()
-    except Exception as e:
-        return jsonify({"erro": str(e)}), 500
+REGRAS = {
+    "media_simples": preco_media_simples,
+    # se quiser, adicione outras regras aqui depois (ex.: soma, margem, etc.)
+}
 
-    itens = [
-        {"material": _CACHE_RAW_NAMES[k], "preco": v}
-        for k, v in sorted(_CACHE_DATA.items())
-    ]
-    return jsonify({"materiais": itens, "fonte": MATERIAIS_URL})
-
-
-@app.route("/preco")
+# --------- Endpoint ---------
+@app.route("/preco", methods=["GET"])
 def preco():
     """
-    Exemplo de chamada:
-      /preco?materiais=Couro Bovino, Couro de Tilápia, Jeans
-    Regra: preço = média simples dos preços base.
+    /preco?materiais=Couro%20Bovino,Couro%20de%20Til%C3%A1pia,Jeans&regra=media_simples
     """
-    q = request.args.get("materiais", "").strip()
-    if not q:
+    garantir_precos()
+
+    materias_qs = request.args.get("materiais", "").strip()
+    regra = request.args.get("regra", "media_simples").strip() or "media_simples"
+
+    if not materias_qs:
         return jsonify({"erro": "Parâmetro 'materiais' é obrigatório."}), 400
 
-    try:
-        _garantir_cache()
-    except Exception as e:
-        return jsonify({"erro": str(e)}), 500
+    if regra not in REGRAS:
+        return jsonify({"erro": f"Regra inválida. Use uma destas: {list(REGRAS.keys())}"}), 400
 
-    orig_list = [m.strip() for m in q.split(",") if m.strip()]
-    if not orig_list:
+    # divide por vírgula
+    pedidos = [m.strip() for m in materias_qs.split(",") if m.strip()]
+    if not pedidos:
         return jsonify({"erro": "Nenhum material informado."}), 400
 
-    norm_list = [normaliza_nome(m) for m in orig_list]
+    itens_precificados = []
+    precos_encontrados: List[int] = []
+    nao_encontrados: List[str] = []
 
-    desconhecidos: List[str] = []
-    usados: List[Dict[str, int]] = []
-    soma = 0
+    for m in pedidos:
+        k = norm(m)
+        if k in PRECOS:
+            nome_canonico, p = PRECOS[k]
+            itens_precificados.append({"material": nome_canonico, "preco": p})
+            precos_encontrados.append(p)
+        else:
+            nao_encontrados.append(m)
 
-    for n, original in zip(norm_list, orig_list):
-        if n not in _CACHE_DATA:
-            desconhecidos.append(original)
-            continue
-        price = _CACHE_DATA[n]
-        usados.append({"material": _CACHE_RAW_NAMES[n], "preco": price})
-        soma += price
+    if nao_encontrados:
+        # sugiro opções válidas (os nomes canônicos do CSV)
+        sugestoes = sorted(list({canon for (canon, _) in PRECOS.values()}))
+        return jsonify({
+            "erro": "Materiais desconhecidos.",
+            "nao_encontrados": nao_encontrados,
+            "sugestoes_disponiveis": sugestoes
+        }), 400
 
-    if desconhecidos:
-        # sugere catálogo disponível
-        disponiveis = sorted(_CACHE_RAW_NAMES.values())
-        return (
-            jsonify(
-                {
-                    "erro": "Materiais desconhecidos.",
-                    "nao_encontrados": desconhecidos,
-                    "sugestoes_disponiveis": disponiveis,
-                }
-            ),
-            400,
-        )
+    preco_final = REGRAS[regra](precos_encontrados)
 
-    # Fórmula de precificação: média simples
-    media = soma / max(len(usados), 1)
-    preco_final = int(round(media))
+    return jsonify({
+        "materiais": [item["material"] for item in itens_precificados],
+        "itens_precificados": itens_precificados,
+        "preco": preco_final,
+        "regra": regra
+    })
 
-    return jsonify(
-        {
-            "materiais": [u["material"] for u in usados],
-            "itens_precificados": usados,  # detalha base usada
-            "regra": "media_simples",
-            "preco": preco_final,
-        }
-    )
+@app.route("/")
+def alive():
+    return jsonify({"ok": True, "materiais_disponiveis": sorted(list({canon for (canon, _) in PRECOS.values()}))})
 
-
-# -------------------------
-# Exec local
-# -------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    # Para rodar local: python app.py
+    app.run(host="0.0.0.0", port=5000)
